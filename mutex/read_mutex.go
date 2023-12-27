@@ -11,9 +11,10 @@ import (
 )
 
 var (
-	ErrInterrupted = errors.New("mutex: interrupted when waiting to retry")
-	ErrTimeout     = errors.New("mutex: timed out waiting for lock")
-	ErrLockFailed  = errors.New("mutex: acquire lock failed")
+	ErrInterrupted  = errors.New("mutex: interrupted when waiting to retry")
+	ErrTimeout      = errors.New("mutex: timed out waiting for lock")
+	ErrLockFailed   = errors.New("mutex: acquire lock failed")
+	ErrLockConflict = errors.New("mutex: acquire lock conflict")
 )
 
 type ReadMutex struct {

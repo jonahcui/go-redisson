@@ -42,6 +42,7 @@ func TestFairLockAcquireAndRelease(t *testing.T) {
 		pubsub:                lockPubSub,
 		client:                client,
 	}
+
 	log.Printf("start get lock2")
 	err = f2.TryLock(context.Background(), 10*time.Second, 100*time.Second)
 	assert.NoError(t, err)

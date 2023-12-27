@@ -5,6 +5,12 @@ import (
 	"github.com/go-redis/redis/v8"
 	"log"
 	"sync"
+	"time"
+)
+
+var (
+	UnlockNotifier = 1
+	ChannelClosed  = 2
 )
 
 type RedissonLockEntry struct {
@@ -12,13 +18,15 @@ type RedissonLockEntry struct {
 	queue     []chan int
 	entryName []string
 	end       chan int
+	waitTime  sync.Map
 }
 
-func (r *RedissonLockEntry) AddToQueue(entryName string, item chan int) {
+func (r *RedissonLockEntry) AddToQueue(entryName string, item chan int, waitTime int64) {
 	r.Lock()
 	defer r.Unlock()
 	r.queue = append(r.queue, item)
 	r.entryName = append(r.entryName, entryName)
+	r.waitTime.Store(entryName, waitTime)
 }
 
 // Remove a listener for the special entry
@@ -31,6 +39,7 @@ func (r *RedissonLockEntry) Remove(entryName string) (shouldClose bool) {
 		if name == entryName {
 			r.entryName = append(r.entryName[:i], r.entryName[i+1:]...)
 			r.queue = append(r.queue[:i], r.queue[i+1:]...)
+			r.waitTime.Delete(entryName)
 			break
 		}
 	}
@@ -62,8 +71,14 @@ func (r *RedissonLockEntry) watchChannel(pubsub *redis.PubSub) {
 						log.Printf("received message %s from channel %s \n", m.Payload, m.Channel)
 						if m.Payload == "0" {
 							r.Lock()
-							if len(r.queue) > 0 {
-								r.queue[0] <- 1
+							for len(r.queue) > 0 {
+								firstNode := r.entryName[0]
+								if waitTime, ok := r.waitTime.Load(firstNode); ok && waitTime.(int64) > time.Now().UnixMilli() {
+									r.queue[0] <- UnlockNotifier
+									r.queue = r.queue[1:]
+									r.entryName = r.entryName[1:]
+									break
+								}
 								r.queue = r.queue[1:]
 								r.entryName = r.entryName[1:]
 							}
@@ -99,7 +114,7 @@ func NewLockPubSub(client *redis.Client) *LockPubSub {
 	}
 }
 
-func (ps *LockPubSub) Subscribe(ctx context.Context, channel string, entryName string, queue chan int) error {
+func (ps *LockPubSub) Subscribe(ctx context.Context, channel string, entryName string, queue chan int, waitTime int64) error {
 	// if the ctx has done, return immediately
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -122,7 +137,7 @@ func (ps *LockPubSub) Subscribe(ctx context.Context, channel string, entryName s
 	}
 	entry := ps.entries[channel]
 
-	entry.AddToQueue(entryName, queue)
+	entry.AddToQueue(entryName, queue, waitTime)
 
 	// fix this
 	go func() {

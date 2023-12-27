@@ -13,84 +13,66 @@ type FairLock struct {
 	name string
 
 	internalLockLeaseTime time.Duration
-
-	value        string
-	client       *redis.Client
-	pubsub       *pubsub.LockPubSub
-	watchDogFlag chan int
+	value                 string
+	client                *redis.Client
+	pubsub                *pubsub.LockPubSub
 }
 
 func (f *FairLock) TryLock(parentCtx context.Context, waitTime time.Duration, lease time.Duration) error {
 	ctx, cancel := context.WithTimeout(parentCtx, waitTime)
 	defer cancel()
+	startTime := time.Now().UnixMilli()
 
 	value, err := genValue()
 	if err != nil {
 		return err
 	}
 
-	start := time.Now().UnixMilli()
-	ttl, err := f.acquireFairLockWithLongReturn(ctx, value, lease, waitTime)
-	end := time.Now().UnixMilli()
+	err = f.tryAcquire(ctx, parentCtx, value, waitTime, lease)
 
-	if err != nil {
-		return err
+	if err == nil {
+		//lock acquired
+		return nil
 	}
 
-	// get lock
-	if ttl == nil && err == nil {
-		log.Printf("get lock %s from %s successful", f.name, f.value)
-		f.value = value
-		if lease.Milliseconds() > end-start {
-			f.internalLockLeaseTime = time.Duration(lease.Milliseconds()-(end-start)) * time.Millisecond
-		} else {
-			//TODO: do guard dog logic
-		}
+	if !errors.Is(err, ErrLockConflict) {
 		return err
 	}
 
 	// wait notifier
 	msg := make(chan int)
-
-	err = f.pubsub.Subscribe(ctx, f.channelName()+":"+value, value, msg)
+	end := time.Now().UnixMilli()
+	err = f.pubsub.Subscribe(ctx, f.channelName()+":"+value, value, msg, time.Now().UnixMilli()+int64(time.Duration(end-startTime)*time.Millisecond))
 	if err != nil {
 		return err
 	}
 
-	timer := time.NewTimer(time.Duration(*ttl) * time.Millisecond)
-	unsubscribe := func() {
-		timer.Stop()
-		f.pubsub.Unsubscribe(f.channelName(), value)
-	}
+	defer f.pubsub.Unsubscribe(f.channelName(), value)
+
 	for {
 		select {
 		case <-ctx.Done():
-			unsubscribe()
 			return ErrTimeout
-		case <-timer.C:
+		case m := <-msg:
 			{
-				unsubscribe()
-				return ErrTimeout
-			}
-		case <-msg:
-			{
-				end = time.Now().UnixMilli()
-				timeoutCtx, cancel := context.WithTimeout(ctx, waitTime-time.Duration(end-start)*time.Millisecond)
-				nttl, err := f.acquireFairLockWithLongReturn(timeoutCtx, value, waitTime, lease)
-				cancel()
-
-				if err != nil {
-					unsubscribe()
-					return err
+				if m == pubsub.ChannelClosed {
+					return ErrInterrupted
 				}
 
-				if nttl == nil {
-					f.value = value
-					unsubscribe()
+				err := func() error {
+					end := time.Now().UnixMilli()
+					timeoutCtx, cancel := context.WithTimeout(ctx, waitTime-time.Duration(end-startTime)*time.Millisecond)
+					defer cancel()
+					return f.tryAcquire(timeoutCtx, parentCtx, value, waitTime, lease)
+				}()
+
+				if err == nil {
 					return nil
 				}
-				// because I use timeout to control the channel, so I don't need to renew the ttl for the pubsub.
-				// in the java version redisson, the listener was renewed
+
+				if !errors.Is(err, ErrLockConflict) {
+					return err
+				}
 			}
 		}
 	}
@@ -116,6 +98,54 @@ func (f *FairLock) Unlock(ctx context.Context, requestId string, retries int, la
 	}
 
 	return true, nil
+}
+
+func (f *FairLock) tryAcquire(ctx context.Context, renewCtx context.Context, value string, waitTime time.Duration, lease time.Duration) error {
+	if lease == 0 {
+		lease = f.internalLockLeaseTime
+	}
+
+	ttl, err := f.acquireFairLockWithLongReturn(ctx, value, lease, waitTime)
+
+	if err != nil {
+		return err
+	}
+
+	// lock acquired
+	if ttl == nil {
+		log.Printf("get lock %s from %s successful", f.name, f.value)
+		f.value = value
+		if lease.Milliseconds() > 0 {
+			f.internalLockLeaseTime = lease
+		} else {
+			go f.scheduleExpirationRenewal(renewCtx)
+		}
+
+		return nil
+	}
+
+	return ErrLockConflict
+}
+
+func (f *FairLock) scheduleExpirationRenewal(ctx context.Context) {
+	timer := time.NewTimer(f.internalLockLeaseTime)
+	for {
+		select {
+		case <-ctx.Done():
+			{
+				log.Printf("cancel expiration renewal because context closed.")
+				return
+			}
+		case <-timer.C:
+			{
+				renew, _ := f.renew(ctx, f.name, f.value, f.internalLockLeaseTime)
+				if !renew {
+					log.Printf("cancel expiration renewal because lock released")
+					return
+				}
+			}
+		}
+	}
 }
 
 var (
@@ -292,6 +322,23 @@ func (f *FairLock) release(ctx context.Context, value, requestId string, latchTi
 	}
 
 	return true, err
+}
+
+var renewLockScript = `
+if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then 
+redis.call('pexpire', KEYS[1], ARGV[1]); 
+return 1; 
+end; 
+return 0;
+`
+
+func (f *FairLock) renew(ctx context.Context, name, value string, leaseTime time.Duration) (bool, error) {
+	cmd := f.client.Eval(ctx, renewLockScript, []string{name}, leaseTime.Milliseconds(), value)
+	if errors.Is(cmd.Err(), redis.Nil) {
+		return false, nil
+	}
+
+	return cmd.Bool()
 }
 
 func (f *FairLock) threadQueueName() string {
